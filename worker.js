@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "3.0.1";
+const CURRENT_VERSION = "3.0.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -76,7 +76,93 @@ const SYSTEM_DEFAULTS = {
     ],
 };
 
-let sysConfig = { ...SYSTEM_DEFAULTS };
+const freshDefaults = () => structuredClone(SYSTEM_DEFAULTS);
+let sysConfig = freshDefaults();
+let sysConfigEverLoaded = false;
+let sysUsageEverLoaded = false;
+
+// ─── Security helpers ───────────────────────────────────────────────
+const DEFAULT_MASTER_KEY = SYSTEM_DEFAULTS.masterKey;
+// Constant-time-ish string comparison (does not short-circuit on first diff).
+function safeEqual(a, b) {
+    if (typeof a !== "string" || typeof b !== "string") return false;
+    const len = Math.max(a.length, b.length);
+    let diff = a.length ^ b.length;
+    for (let i = 0; i < len; i++)
+        diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+    return diff === 0;
+}
+function isMasterKey(k) {
+    return (
+        typeof k === "string" &&
+        k.length > 0 &&
+        typeof sysConfig.masterKey === "string" &&
+        sysConfig.masterKey.length > 0 &&
+        safeEqual(k, sysConfig.masterKey)
+    );
+}
+function escapeHtml(v) {
+    return String(v ?? "").replace(
+        /[&<>"']/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+    );
+}
+// Failed-login throttle (per isolate, per IP): 10 failures / 10 minutes.
+const authFailures = new Map();
+const AUTH_WINDOW_MS = 600000;
+const AUTH_MAX_FAILS = 10;
+function isAuthRateLimited(ip) {
+    const e = authFailures.get(ip);
+    if (!e) return false;
+    if (Date.now() - e.first > AUTH_WINDOW_MS) {
+        authFailures.delete(ip);
+        return false;
+    }
+    return e.count >= AUTH_MAX_FAILS;
+}
+function recordAuthFailure(ip) {
+    if (authFailures.size > 5000) authFailures.clear();
+    const e = authFailures.get(ip);
+    if (!e || Date.now() - e.first > AUTH_WINDOW_MS)
+        authFailures.set(ip, { first: Date.now(), count: 1 });
+    else e.count++;
+}
+async function guardAuth(request, fn) {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    if (isAuthRateLimited(ip))
+        return new Response(
+            JSON.stringify({ success: false, error: "Too many attempts" }),
+            {
+                status: 429,
+                headers: { "Content-Type": "application/json", "Retry-After": "600" },
+            },
+        );
+    const res = await fn();
+    if (res && res.status === 401) recordAuthFailure(ip);
+    return res;
+}
+// Secret sent by Telegram in X-Telegram-Bot-Api-Secret-Token (derived from the
+// bot token, so nothing new is stored).
+async function tgWebhookSecret(token) {
+    const d = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode("ducks-tg-webhook:" + token),
+    );
+    return Array.from(new Uint8Array(d))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+}
+async function registerTgWebhook(token, hookUrl) {
+    return fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            url: hookUrl,
+            secret_token: await tgWebhookSecret(token),
+        }),
+    });
+}
+let lastTgWebhookRefresh = 0;
 let isolateStartTime = 0;
 let activeConnections = 0;
 let uuidUsage = new Map();
@@ -136,30 +222,38 @@ async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
     );
 }
 
+let d1Initialized = false;
 async function d1Init(env) {
-    if (env.IOT_DB && !env.IOT_DB_INITIALIZED) {
+    if (env.IOT_DB && !d1Initialized) {
         try {
             await env.IOT_DB.prepare(
                 "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)",
             ).run();
-            env.IOT_DB_INITIALIZED = true;
+            d1Initialized = true;
         } catch (e) {
-            env.IOT_DB_INITIALIZED = true;
+            console.error("[d1] init failed:", relayErr(e));
         }
     }
 }
-async function d1Get(env, key) {
+// Throws on database errors (null only when the key does not exist).
+async function d1GetStrict(env, key) {
     if (!env.IOT_DB) return null;
     await d1Init(env);
-    try {
-        const { results } = await env.IOT_DB.prepare(
-            "SELECT value FROM kv_store WHERE key = ?",
-        )
-            .bind(key)
-            .all();
-        if (results && results.length > 0) return results[0].value;
-    } catch (e) {}
+    const { results } = await env.IOT_DB.prepare(
+        "SELECT value FROM kv_store WHERE key = ?",
+    )
+        .bind(key)
+        .all();
+    if (results && results.length > 0) return results[0].value;
     return null;
+}
+async function d1Get(env, key) {
+    try {
+        return await d1GetStrict(env, key);
+    } catch (e) {
+        console.error("[d1] get failed:", key, relayErr(e));
+        return null;
+    }
 }
 async function d1Put(env, key, value) {
     if (!env.IOT_DB) return;
@@ -170,7 +264,10 @@ async function d1Put(env, key, value) {
         )
             .bind(key, value)
             .run();
-    } catch (e) {}
+    } catch (e) {
+        console.error("[d1] put failed:", key, relayErr(e));
+        throw e;
+    }
 }
 
 async function cachedD1Put(env, key, value) {
@@ -300,7 +397,7 @@ function isPanelApiKey(key) {
         !Array.isArray(sysConfig.panelApiKeys)
     )
         return false;
-    return sysConfig.panelApiKeys.some((k) => k.key === key);
+    return sysConfig.panelApiKeys.some((k) => k && safeEqual(k.key, key));
 }
 
 function extractAuthKey(request, data) {
@@ -313,13 +410,15 @@ function extractAuthKey(request, data) {
 
 function isAuthorized(request, data) {
     const key = extractAuthKey(request, data);
-    return key === sysConfig.masterKey || isPanelApiKey(key);
+    return isMasterKey(key) || isPanelApiKey(key);
 }
 
 function generateApiKey(name) {
     const id = crypto.randomUUID();
-    const raw = `ducks_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    const key = raw;
+    const rnd = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    const key = `ducks_${Date.now().toString(36)}_${rnd}`;
     return {
         id,
         name: name || "Unnamed Key",
@@ -443,6 +542,14 @@ export default {
             if (!isolateStartTime) isolateStartTime = Date.now();
             if (configRegistry.size > 10000) { configRegistry.clear(); trojanHashCache.clear(); }
             await loadSysConfig(env, ctx);
+            if (env.IOT_DB && !sysConfigEverLoaded) {
+                // Database unreachable and no config was ever loaded: refuse
+                // to run on built-in defaults (default master key!).
+                return new Response("Service temporarily unavailable", {
+                    status: 503,
+                    headers: { "Retry-After": "5" },
+                });
+            }
             activeDeviceId =
                 sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
 
@@ -518,7 +625,7 @@ export default {
                 if (reqPath === routes.auth) {
                     if (request.method !== "POST")
                         return new Response("405", { status: 405 });
-                    return await handleAuth(request, url.hostname, ctx, env);
+                    return await guardAuth(request, () => handleAuth(request, url.hostname, ctx, env));
                 }
                 if (reqPath === routes.sync || isSyncRoute) {
                     if (request.method === "OPTIONS") {
@@ -535,7 +642,7 @@ export default {
                     }
                     if (request.method !== "POST")
                         return new Response("405", { status: 405 });
-                    const syncRes = await handleConfigSync(request, env, ctx);
+                    const syncRes = await guardAuth(request, () => handleConfigSync(request, env, ctx));
                     syncRes.headers.set("Access-Control-Allow-Origin", "*");
                     syncRes.headers.set(
                         "Access-Control-Allow-Headers",
@@ -546,19 +653,19 @@ export default {
                 if (reqPath === routes.logs) {
                     if (request.method !== "POST" && request.method !== "GET")
                         return new Response("405", { status: 405 });
-                    return await handleLogs(request, env);
+                    return await guardAuth(request, () => handleLogs(request, env));
                 }
                 if (isUsersRoute) {
-                    return await handleUsersApi(request, env, ctx);
+                    return await guardAuth(request, () => handleUsersApi(request, env, ctx));
                 }
                 if (isStatsRoute) {
-                    return await handleStatsApi(request, env);
+                    return await guardAuth(request, () => handleStatsApi(request, env));
                 }
                 if (isUpdateRoute) {
-                    return await handleUpdateApi(request, env, ctx);
+                    return await guardAuth(request, () => handleUpdateApi(request, env, ctx));
                 }
                 if (isApiKeysRoute) {
-                    return await handleApiKeys(request, env, ctx);
+                    return await guardAuth(request, () => handleApiKeys(request, env, ctx));
                 }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST")
@@ -691,20 +798,20 @@ export default {
                                     dailyProgress = '<p class="text-[10px] text-muted mt-2" data-i18n="noDailyLimit">No Daily Limit</p>';
                                 }
                                 // Replace placeholders
-                                html = html.replace(/__USER_NAME__/g, targetUser.name);
-                                html = html.replace(/__USER_ID__/g, targetUser.id);
-                                html = html.replace(/__STATUS_CODE__/g, statusCode);
-                                html = html.replace(/__TOTAL_GB__/g, totalGb);
-                                html = html.replace(/__LIMIT_TOTAL_GB__/g, limitTotalGb);
-                                html = html.replace(/__TOTAL_PERCENT__/g, totalPercent);
-                                html = html.replace(/__DAILY_GB__/g, dailyGb);
-                                html = html.replace(/__LIMIT_DAILY_GB__/g, limitDailyGb);
-                                html = html.replace(/__DAILY_PERCENT__/g, dailyPercent);
-                                html = html.replace(/__EXPIRY_DATE__/g, expiryDateTxt);
-                                html = html.replace(/__SYNC_NORMAL__/g, syncNormal);
-                                html = html.replace(/__SYNC_RAW__/g, syncRaw);
-                                html = html.replace(/__TOTAL_PROGRESS__/g, totalProgress);
-                                html = html.replace(/__DAILY_PROGRESS__/g, dailyProgress);
+                                html = html.replace(/__USER_NAME__/g, () => escapeHtml(targetUser.name));
+                                html = html.replace(/__USER_ID__/g, () => escapeHtml(targetUser.id));
+                                html = html.replace(/__STATUS_CODE__/g, () => escapeHtml(statusCode));
+                                html = html.replace(/__TOTAL_GB__/g, () => escapeHtml(totalGb));
+                                html = html.replace(/__LIMIT_TOTAL_GB__/g, () => escapeHtml(limitTotalGb));
+                                html = html.replace(/__TOTAL_PERCENT__/g, () => escapeHtml(totalPercent));
+                                html = html.replace(/__DAILY_GB__/g, () => escapeHtml(dailyGb));
+                                html = html.replace(/__LIMIT_DAILY_GB__/g, () => escapeHtml(limitDailyGb));
+                                html = html.replace(/__DAILY_PERCENT__/g, () => escapeHtml(dailyPercent));
+                                html = html.replace(/__EXPIRY_DATE__/g, () => escapeHtml(expiryDateTxt));
+                                html = html.replace(/__SYNC_NORMAL__/g, () => escapeHtml(syncNormal));
+                                html = html.replace(/__SYNC_RAW__/g, () => escapeHtml(syncRaw));
+                                html = html.replace(/__TOTAL_PROGRESS__/g, () => totalProgress);
+                                html = html.replace(/__DAILY_PROGRESS__/g, () => dailyProgress);
                                 return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
                             } catch (e) {
                                 return new Response('Failed to load subscription page', { status: 502 });
@@ -931,6 +1038,7 @@ export default {
 
             return new Response(null, { status: 404 });
         } catch (err) {
+            console.error("[fetch] unhandled error:", relayErr(err));
             return new Response(null, { status: 404 });
         }
     },
@@ -1029,6 +1137,8 @@ async function serveMaintenancePage(request, url) {
         const cleanHeaders = new Headers(request.headers);
         cleanHeaders.set("Host", targetUrl.hostname);
         cleanHeaders.delete("cf-connecting-ip");
+        cleanHeaders.delete("authorization");
+        cleanHeaders.delete("cookie");
         cleanHeaders.delete("x-forwarded-for");
         const fetchInit = {
             method: request.method,
@@ -1081,12 +1191,13 @@ async function loadSysConfig(env, ctx = null) {
     if (env.IOT_DB) {
         if (now - sysConfigCacheTime > CACHE_TTL_CONFIG) {
             if (!sysConfigLoading) {
-                sysConfigLoading = d1Get(env, "sys_config")
+                sysConfigLoading = d1GetStrict(env, "sys_config")
                     .then((stored) => {
                         sysConfig = {
-                            ...SYSTEM_DEFAULTS,
+                            ...freshDefaults(),
                             ...(stored ? JSON.parse(stored) : null),
                         };
+                        sysConfigEverLoaded = true;
                         sysConfigCacheTime = Date.now();
                         if (migrateSlaveNodesToLinkedPanels(sysConfig)) {
                             const promise = cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
@@ -1097,9 +1208,12 @@ async function loadSysConfig(env, ctx = null) {
                             }
                         }
                     })
-                    .catch(() => {
-                        sysConfig = { ...SYSTEM_DEFAULTS };
-                        sysConfigCacheTime = Date.now();
+                    .catch((e) => {
+                        // Fail closed: keep the last good config (never fall back
+                        // to defaults, which include the default master key) and
+                        // retry shortly.
+                        console.error("[config] load failed:", relayErr(e));
+                        sysConfigCacheTime = Date.now() - CACHE_TTL_CONFIG + 2000;
                     })
                     .finally(() => {
                         sysConfigLoading = null;
@@ -1109,15 +1223,18 @@ async function loadSysConfig(env, ctx = null) {
         }
         if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
             if (!sysUsageLoading) {
-                sysUsageLoading = d1Get(env, "sys_usage")
+                sysUsageLoading = d1GetStrict(env, "sys_usage")
                     .then((ustored) => {
                         if (ustored) sysUsageCache = JSON.parse(ustored);
                         else sysUsageCache = { users: {} };
+                        sysUsageEverLoaded = true;
                         sysUsageCacheTime = Date.now();
                     })
-                    .catch(() => {
-                        sysUsageCache = { users: {} };
-                        sysUsageCacheTime = Date.now();
+                    .catch((e) => {
+                        // Keep in-memory usage; resetting to empty would wipe
+                        // every user's counters on the next write.
+                        console.error("[usage] load failed:", relayErr(e));
+                        sysUsageCacheTime = Date.now() - CACHE_TTL_USAGE + 2000;
                     })
                     .finally(() => {
                         sysUsageLoading = null;
@@ -1308,9 +1425,14 @@ async function handleLogs(request, env) {
                 const stored = await d1Get(env, "sys_logs");
                 if (stored) logs = JSON.parse(stored);
             }
-            return new Response(JSON.stringify({ success: true, logs }), {
-                status: 200,
-            });
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    logs,
+                    diag: { stats: relayStats, recent: relayDiag },
+                }),
+                { status: 200 },
+            );
         }
         return new Response("OK", { status: 200 });
     } catch (e) {
@@ -1340,8 +1462,8 @@ async function handleUsersApi(request, env, ctx) {
             } catch (e) {}
         }
         const isAuth =
-            authKey === sysConfig.masterKey ||
-            bodyKey === sysConfig.masterKey ||
+            isMasterKey(authKey) ||
+            isMasterKey(bodyKey) ||
             isPanelApiKey(authKey) ||
             isPanelApiKey(bodyKey);
         if (!isAuth) {
@@ -1485,10 +1607,31 @@ async function handleUsersApi(request, env, ctx) {
                         headers: { "Content-Type": "application/json" },
                     },
                 );
+            if (typeof name !== "string" || !name.trim() || name.trim().length > 64)
+                return new Response(
+                    JSON.stringify({ success: false, error: "Invalid name (1-64 chars)" }),
+                    { status: 400, headers: { "Content-Type": "application/json" } },
+                );
+            if (
+                (sysConfig.users || []).some(
+                    (u) => u.name.toLowerCase() === name.trim().toLowerCase(),
+                )
+            )
+                return new Response(
+                    JSON.stringify({ success: false, error: "Name already exists" }),
+                    { status: 409, headers: { "Content-Type": "application/json" } },
+                );
+            for (const f of [trafficLimit, body.dailyLimit, expiryDays, maxConfigs, connLimit]) {
+                if (f !== undefined && f !== null && f !== "" && !Number.isFinite(Number(f)))
+                    return new Response(
+                        JSON.stringify({ success: false, error: "Invalid numeric field" }),
+                        { status: 400, headers: { "Content-Type": "application/json" } },
+                    );
+            }
             const newId = crypto.randomUUID();
             const newUser = {
                 id: newId,
-                name: name,
+                name: name.trim(),
                 limitTotalReq: trafficLimit
                     ? Math.floor(parseFloat(trafficLimit) * 6000)
                     : null,
@@ -1555,7 +1698,23 @@ async function handleUsersApi(request, env, ctx) {
                         headers: { "Content-Type": "application/json" },
                     },
                 );
-            if (body.name !== undefined) u.name = body.name;
+            if (body.name !== undefined) {
+                if (typeof body.name !== "string" || !body.name.trim() || body.name.trim().length > 64)
+                    return new Response(
+                        JSON.stringify({ success: false, error: "Invalid name (1-64 chars)" }),
+                        { status: 400, headers: { "Content-Type": "application/json" } },
+                    );
+                if (
+                    sysConfig.users.some(
+                        (x) => x !== u && x.name.toLowerCase() === body.name.trim().toLowerCase(),
+                    )
+                )
+                    return new Response(
+                        JSON.stringify({ success: false, error: "Name already exists" }),
+                        { status: 409, headers: { "Content-Type": "application/json" } },
+                    );
+                u.name = body.name.trim();
+            }
             if (body.trafficLimit !== undefined)
                 u.limitTotalReq = body.trafficLimit
                     ? Math.floor(parseFloat(body.trafficLimit) * 6000)
@@ -1731,7 +1890,7 @@ async function handleStatsApi(request, env) {
             authHeader.replace("Bearer ", "") ||
             url.searchParams.get("key") ||
             "";
-        if (authKey !== sysConfig.masterKey && !isPanelApiKey(authKey)) {
+        if (!isMasterKey(authKey) && !isPanelApiKey(authKey)) {
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
                 {
@@ -1834,7 +1993,7 @@ async function handleUpdateApi(request, env, ctx) {
             return new Response("405", { status: 405 });
         const data = await request.json();
         const deployKey = extractAuthKey(request, data);
-        if (deployKey !== sysConfig.masterKey) {
+        if (!isMasterKey(deployKey)) {
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
                 {
@@ -1850,6 +2009,16 @@ async function handleUpdateApi(request, env, ctx) {
         const repo = (sysConfig.githubRepo || "sep5ehr/DucksPanel")
             .replace(/https?:\/\/github\.com\//, "")
             .trim();
+
+        if (data.action === "deploy" && sysConfig.masterKey === DEFAULT_MASTER_KEY) {
+            return new Response(
+                JSON.stringify({
+                    success: false,
+                    error: "Change the default master key before deploying code through the panel",
+                }),
+                { status: 403, headers: { "Content-Type": "application/json" } },
+            );
+        }
 
         if (data.action === "check") {
             let remoteVer = null;
@@ -2113,7 +2282,7 @@ async function handleApiKeys(request, env, ctx) {
         const method = request.method;
 
         const authKey = extractAuthKey(request, null);
-        if (authKey !== sysConfig.masterKey) {
+        if (!isMasterKey(authKey)) {
             return new Response(
                 JSON.stringify({
                     success: false,
@@ -2232,7 +2401,7 @@ async function handleAuth(request, hostName, ctx, env) {
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
         const loginKey = data.key || "";
         const isKeyAuth =
-            loginKey === sysConfig.masterKey || isPanelApiKey(loginKey);
+            isMasterKey(loginKey) || isPanelApiKey(loginKey);
         if (isKeyAuth) {
             if (isPanelApiKey(loginKey)) {
                 const apiKeyEntry = (sysConfig.panelApiKeys || []).find(
@@ -2262,7 +2431,6 @@ async function handleAuth(request, hostName, ctx, env) {
                     name: sysConfig.name || hostName,
                     host: hostName,
                     apiRoute: sysConfig.apiRoute,
-                    masterKey: sysConfig.masterKey,
                     isLocal: true,
                     ts: Date.now(),
                 };
@@ -2306,6 +2474,22 @@ async function handleAuth(request, hostName, ctx, env) {
                 } catch (e) {}
             }
 
+            // Heal/refresh the Telegram webhook so it carries the secret token.
+            if (
+                isMasterKey(loginKey) &&
+                sysConfig.tgToken &&
+                ctx &&
+                Date.now() - lastTgWebhookRefresh > 3600000
+            ) {
+                lastTgWebhookRefresh = Date.now();
+                ctx.waitUntil(
+                    registerTgWebhook(
+                        sysConfig.tgToken,
+                        `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/tg`,
+                    ).catch(() => {}),
+                );
+            }
+
             const netInfo = {
                 ip: ip,
                 colo: request.cf?.colo || "Unknown",
@@ -2347,8 +2531,20 @@ async function handleAuth(request, hostName, ctx, env) {
                               tgChatId: "[PROTECTED]",
                               tgAdminId: "[PROTECTED]",
                               syncApiKey: "[PROTECTED]",
+                              upstreamUri: sysConfig.upstreamUri ? "[PROTECTED]" : "",
+                              linkedPanels: (Array.isArray(sysConfig.linkedPanels)
+                                  ? sysConfig.linkedPanels
+                                  : []
+                              ).map((lp) => ({
+                                  ...lp,
+                                  apiKey: lp && lp.apiKey ? "[PROTECTED]" : lp && lp.apiKey,
+                              })),
                           }
                         : sysConfig,
+                    warnings:
+                        sysConfig.masterKey === DEFAULT_MASTER_KEY
+                            ? ["DEFAULT_MASTER_KEY: change the master key in settings"]
+                            : [],
                     deviceId: activeDeviceId,
                     network: netInfo,
                     usage: usageData,
@@ -2396,15 +2592,18 @@ async function handleAuth(request, hostName, ctx, env) {
 async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
-        const isAuthSync =
-            data.key === sysConfig.masterKey ||
-            (data.oldKey && data.oldKey === sysConfig.masterKey) ||
-            isPanelApiKey(data.key) ||
-            isPanelApiKey(data.oldKey) ||
-            (data.fromMaster &&
+        const callerIsMaster =
+            isMasterKey(data.key) ||
+            isMasterKey(data.oldKey) ||
+            !!(
+                data.fromMaster &&
                 data.config &&
-                data.config.masterKey &&
-                data.config.masterKey === sysConfig.masterKey);
+                isMasterKey(data.config.masterKey)
+            );
+        const isAuthSync =
+            callerIsMaster ||
+            isPanelApiKey(data.key) ||
+            isPanelApiKey(data.oldKey);
         if (!isAuthSync)
             return new Response(
                 JSON.stringify({
@@ -2421,6 +2620,41 @@ async function handleConfigSync(request, env, ctx) {
 
         let nextConfig = sysConfig;
         if (data.config) {
+            if (typeof data.config !== "object" || Array.isArray(data.config))
+                return new Response(
+                    JSON.stringify({ success: false, error: "Invalid config" }),
+                    { status: 400 },
+                );
+            if (data.config.users !== undefined && !Array.isArray(data.config.users))
+                return new Response(
+                    JSON.stringify({ success: false, error: "Invalid users" }),
+                    { status: 400 },
+                );
+            // Non-master callers (API keys) may not touch secrets / identity.
+            // "[PROTECTED]" placeholders returned by /api/auth are never stored.
+            const PROTECTED_FIELDS = [
+                "masterKey", "panelApiKeys", "cfAccountId", "cfApiToken",
+                "cfWorkerName", "tgToken", "tgChatId", "tgAdminId",
+                "syncApiKey", "githubRepo", "linkedPanels", "hubPanelUrl",
+                "slaveNodes", "apiRoute", "deviceId",
+            ];
+            data.config = { ...data.config };
+            for (const k of Object.keys(data.config)) {
+                if (data.config[k] === "[PROTECTED]") delete data.config[k];
+            }
+            if (!callerIsMaster) {
+                PROTECTED_FIELDS.forEach((k) => delete data.config[k]);
+                if (data.config.upstreamUri === "[PROTECTED]") delete data.config.upstreamUri;
+            }
+            if (Array.isArray(data.config.linkedPanels)) {
+                // keep stored apiKeys where the client sent placeholders
+                const old = Array.isArray(sysConfig.linkedPanels) ? sysConfig.linkedPanels : [];
+                data.config.linkedPanels = data.config.linkedPanels.map((lp) =>
+                    lp && lp.apiKey === "[PROTECTED]"
+                        ? { ...lp, apiKey: (old.find((o) => o && o.url === lp.url) || {}).apiKey || "" }
+                        : lp,
+                );
+            }
             const preserveApiKeys = sysConfig.panelApiKeys || [];
             nextConfig = { ...sysConfig, ...data.config };
             if (Array.isArray(nextConfig.users)) {
@@ -2565,14 +2799,7 @@ async function handleConfigSync(request, env, ctx) {
         if (nextConfig.tgToken && ctx) {
             const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
             ctx.waitUntil(
-                fetch(
-                    `https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`,
-                    {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ url: hookUrl }),
-                    },
-                ).catch(() => {}),
+                registerTgWebhook(nextConfig.tgToken, hookUrl).catch(() => {}),
             );
         }
 
@@ -2606,6 +2833,16 @@ async function handleSyncPanel(request, env, ctx) {
                 { status: 400 },
             );
         }
+        const hostOk = /^[A-Za-z0-9.-]{1,253}(:\d{1,5})?$/.test(String(data.panelHost));
+        const routeOk =
+            data.panelApiRoute === undefined ||
+            /^[A-Za-z0-9_\-.~%]{1,100}$/.test(String(data.panelApiRoute));
+        if (!hostOk || !routeOk) {
+            return new Response(
+                JSON.stringify({ success: false, error: "Invalid fields" }),
+                { status: 400 },
+            );
+        }
         // Verify the tgAdminId matches this panel's config
         const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
         if (!adminId || adminId.toString() !== data.tgAdminId.toString()) {
@@ -2622,7 +2859,7 @@ async function handleSyncPanel(request, env, ctx) {
             );
         }
         const loginSignal = {
-            name: data.panelName || data.panelHost,
+            name: String(data.panelName || data.panelHost).slice(0, 64),
             host: data.panelHost,
             apiRoute: data.panelApiRoute || sysConfig.apiRoute,
             isLocal: false,
@@ -3044,6 +3281,12 @@ async function remotePanelResetTraffic(panel, userId) {
 
 async function handleTelegramWebhook(request, env, hostName, ctx) {
     try {
+        if (!sysConfig.tgToken) return new Response("OK", { status: 200 });
+        const gotSecret =
+            request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+        if (!safeEqual(gotSecret, await tgWebhookSecret(sysConfig.tgToken))) {
+            return new Response(JSON.stringify({ success: false }), { status: 401 });
+        }
         const update = await request.json();
         const tgApi = `https://api.telegram.org/bot${sysConfig.tgToken}`;
 
@@ -6050,6 +6293,181 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         return new Response("OK", { status: 200 });
     }
 }
+// ─── Relay diagnostics (no credentials, no user identifiers) ─────────────
+// Ring buffer + counters, exposed to authenticated admins through
+// POST /<route>/api/logs ("diag" field) and printed with console.log("[relay] ...").
+// Destination hostnames are only recorded when the worker has the variable
+// RELAY_DEBUG=1 (they reveal browsing activity, so they are off by default).
+const RELAY_FIRST_BYTE_TIMEOUT_MS = 8000;
+const RELAY_OPEN_TIMEOUT_MS = 6000;
+const RELAY_REPLAY_CAP = 262144;
+const RELAY_MAX_FALLBACKS = 3;
+const RELAY_DIAG_MAX = 100;
+const relayDiag = [];
+const relayStats = {
+    started: 0,
+    parseFail: 0,
+    authFail: 0,
+    limitReject: 0,
+    directOk: 0,
+    directFail: 0,
+    directNoData: 0,
+    directToCloudflareIp: 0,
+    fallbackOk: 0,
+    fallbackFail: 0,
+    completed: 0,
+};
+
+function relayLog(env, stage, info) {
+    const entry = { ts: new Date().toISOString(), stage, ...info };
+    if (env && env.RELAY_DEBUG) {
+        // host is attached by the caller only when debug is on
+    } else {
+        delete entry.host;
+    }
+    relayDiag.unshift(entry);
+    if (relayDiag.length > RELAY_DIAG_MAX) relayDiag.length = RELAY_DIAG_MAX;
+    try {
+        console.log("[relay] " + JSON.stringify(entry));
+    } catch (e) {}
+}
+
+function relayErr(e) {
+    return String((e && e.message) || e || "unknown").slice(0, 120);
+}
+
+// Published Cloudflare IPv4 ranges (https://www.cloudflare.com/ips-v4).
+// Workers cannot open outbound TCP connections to these addresses; this is
+// used only to label diagnostics.
+const CF_V4_RANGES = [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+].map((c) => {
+    const [ip, bits] = c.split("/");
+    const n = ip.split(".").reduce((a, o) => ((a << 8) + parseInt(o, 10)) >>> 0, 0);
+    const mask = bits === "0" ? 0 : (0xffffffff << (32 - parseInt(bits, 10))) >>> 0;
+    return { base: (n & mask) >>> 0, mask };
+});
+function isCloudflareIPv4(ip) {
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip || "")) return false;
+    const n = ip.split(".").reduce((a, o) => ((a << 8) + parseInt(o, 10)) >>> 0, 0);
+    return CF_V4_RANGES.some((r) => ((n & r.mask) >>> 0) === r.base);
+}
+
+function withTimeout(p, ms, label) {
+    let t;
+    return Promise.race([
+        p,
+        new Promise((_, rej) => {
+            t = setTimeout(() => rej(new Error(label + "_timeout")), ms);
+        }),
+    ]).finally(() => clearTimeout(t));
+}
+
+function safeCloseSocket(s) {
+    try {
+        if (s) s.close();
+    } catch (e) {}
+}
+function safeCloseWs(ws, code, reason) {
+    try {
+        if (ws.readyState === 1 || ws.readyState === 2) ws.close(code, reason);
+    } catch (e) {}
+}
+
+// Parses "host", "host:port", "[v6]", "[v6]:port" or a bare IPv6 literal.
+// (The previous code used split(":") which corrupted IPv6/NAT64 entries.)
+function parseRelayTarget(raw, defaultPort) {
+    let s = String(raw || "").trim().split("#")[0].trim();
+    if (!s) return null;
+    let m = s.match(/^\[([0-9a-fA-F:.]+)\](?::(\d{1,5}))?$/);
+    if (m) {
+        const port = m[2] ? parseInt(m[2], 10) : defaultPort;
+        if (!(port > 0 && port < 65536)) return null;
+        return { host: m[1], port, v6: true };
+    }
+    if ((s.match(/:/g) || []).length > 1) {
+        return { host: s, port: defaultPort, v6: true };
+    }
+    const i = s.lastIndexOf(":");
+    if (i > 0) {
+        const port = parseInt(s.slice(i + 1), 10);
+        if (!(port > 0 && port < 65536)) return null;
+        return { host: s.slice(0, i), port, v6: false };
+    }
+    return { host: s, port: defaultPort, v6: false };
+}
+
+const relayDnsCache = new Map();
+async function resolveTargetIPv4(host) {
+    const c = relayDnsCache.get(host);
+    if (c && Date.now() - c.ts < 60000) return c.ip;
+    if (relayDnsCache.size > 2000) relayDnsCache.clear();
+    let ip = null;
+    try {
+        const u = new URL(sysConfig.customDns);
+        u.searchParams.set("name", host);
+        u.searchParams.set("type", "A");
+        const r = await fetch(u.toString(), {
+            headers: { accept: "application/dns-json" },
+            signal: AbortSignal.timeout(3000),
+        });
+        const j = await r.json();
+        // Answer[0] may be a CNAME (type 5); only take real A records.
+        const a = (j.Answer || []).find(
+            (x) => x.type === 1 && /^\d{1,3}(\.\d{1,3}){3}$/.test(x.data || ""),
+        );
+        if (a) ip = a.data;
+    } catch (e) {}
+    relayDnsCache.set(host, { ip, ts: Date.now() });
+    return ip;
+}
+
+// Fallback ("proxy IP") list: profile list, else backupRelay, else customRelay
+// (same precedence as before), tried starting from a stable per-user offset.
+function buildRelayFallbacks(activeProfile, targetPort) {
+    const split = (s) =>
+        String(s || "")
+            .split(/[\r\n,;]+/)
+            .map((x) => x.trim())
+            .filter(Boolean);
+    let list = split(activeProfile && activeProfile.proxyIp);
+    if (list.length === 0) list = split(sysConfig.backupRelay);
+    if (list.length === 0) list = split(sysConfig.customRelay);
+    const parsed = list
+        .map((x) => parseRelayTarget(x, targetPort))
+        .filter(Boolean);
+    if (parsed.length === 0) return [];
+    let start = 0;
+    if (parsed.length > 1) {
+        let hash = 0;
+        const hs = activeProfile ? String(activeProfile.id) : "";
+        for (let i = 0; i < hs.length; i++)
+            hash = hs.charCodeAt(i) + ((hash << 5) - hash);
+        start = Math.abs(hash) % parsed.length;
+    }
+    const out = [];
+    for (let a = 0; a < Math.min(parsed.length, RELAY_MAX_FALLBACKS); a++)
+        out.push(parsed[(start + a) % parsed.length]);
+    return out;
+}
+
+// The "Default" profile's UUID is derived from apiRoute (guessable). When
+// multi-user mode is on, its subscription is already refused, so the relay
+// refuses it too, unless ALLOW_DEFAULT_PROFILE=1 is set.
+function getRelayProfiles(env) {
+    const all = getAllProfiles();
+    if (
+        sysConfig.users &&
+        sysConfig.users.length > 0 &&
+        !(env && env.ALLOW_DEFAULT_PROFILE)
+    )
+        return all.slice(1);
+    return all;
+}
+
 async function processTelemetryStream(env, ctx, wsRelayIdx) {
     const [client, webSocket] = Object.values(new WebSocketPair());
     webSocket.accept();
@@ -6060,141 +6478,260 @@ async function processTelemetryStream(env, ctx, wsRelayIdx) {
 
 async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
     activeConnections++;
-    webSocket.addEventListener("close", () => {
-        activeConnections--;
-        if (activeClientHash) {
-            let cur = activeConns.get(activeClientHash) || 0;
+    relayStats.started++;
+    let activeClientHash = null;
+    let counted = false; // true only after activeConns was incremented
+    let closed = false;
+    let remoteSocket = null;
+    let dataWriter = null;
+    let isInit = true;
+    let queue = Promise.resolve();
+    let replay = []; // chunks sent to the current attempt (for retry)
+    let replayBytes = 0;
+    let canReplay = true;
+    let switching = false;
+    let attempts = [];
+    let isModeAlpha = false;
+    let destMeta = { kind: "?", port: 0, host: "" };
+
+    const closeAll = (code, reason) => {
+        if (closed) return;
+        closed = true;
+        activeConnections = Math.max(0, activeConnections - 1);
+        if (counted && activeClientHash) {
+            const cur = activeConns.get(activeClientHash) || 0;
             if (cur > 0) activeConns.set(activeClientHash, cur - 1);
         }
-    });
-    webSocket.addEventListener("error", () => {});
-    let remoteSocket,
-        dataWriter,
-        isInit = true,
-        queue = Promise.resolve();
-    let activeClientHash = null;
+        safeCloseSocket(remoteSocket);
+        safeCloseWs(webSocket, code, reason);
+    };
+    webSocket.addEventListener("close", () => closeAll());
+    webSocket.addEventListener("error", () => closeAll());
+
+    const recordChunk = (chunk) => {
+        if (!canReplay) return;
+        const n = chunk && chunk.byteLength ? chunk.byteLength : 0;
+        replayBytes += n;
+        if (replayBytes > RELAY_REPLAY_CAP) {
+            canReplay = false;
+            replay = [];
+            return;
+        }
+        replay.push(chunk);
+    };
+
     webSocket.addEventListener("message", (event) => {
         queue = queue.then(async () => {
+            if (closed) return;
             try {
                 if (isInit) {
                     isInit = false;
-                    const isModeAlpha = await parseSensorData(
-                        event.data,
-                        wsRelayIdx,
-                    );
-                    if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
-                } else if (dataWriter) {
+                    await parseSensorData(event.data, wsRelayIdx);
+                    if (isModeAlpha && !closed)
+                        webSocket.send(new Uint8Array([0, 0]));
+                } else if (switching || !dataWriter) {
+                    recordChunk(event.data);
+                } else {
+                    recordChunk(event.data);
                     await dataWriter.write(event.data);
                 }
             } catch (err) {
-                webSocket.close();
+                relayLog(env, "pipe_error", {
+                    error: relayErr(err),
+                    kind: destMeta.kind,
+                    port: destMeta.port,
+                    host: destMeta.host,
+                });
+                closeAll(1011, "relay error");
             }
         });
     });
 
+    // Opens one attempt, writes everything the client has sent so far.
+    async function openAttempt(att) {
+        const hostArg = att.v6 && att.bracket ? `[${att.host}]` : att.host;
+        const sock = connect({ hostname: hostArg, port: att.port });
+        remoteSocket = sock;
+        await withTimeout(sock.opened, RELAY_OPEN_TIMEOUT_MS, "open");
+        const w = sock.writable.getWriter();
+        dataWriter = w;
+        for (let i = 0; i < replay.length; i++) await w.write(replay[i]);
+        return sock;
+    }
+
+    async function pump(sock, idx) {
+        const att = attempts[idx];
+        const hasMore = idx + 1 < attempts.length;
+        let hadData = false;
+        let err = null;
+        const reader = sock.readable.getReader();
+        try {
+            for (;;) {
+                let res;
+                if (!hadData && hasMore && canReplay && replay.length > 0) {
+                    res = await withTimeout(
+                        reader.read(),
+                        RELAY_FIRST_BYTE_TIMEOUT_MS,
+                        "first_byte",
+                    );
+                } else {
+                    res = await reader.read();
+                }
+                if (res.done) break;
+                const v = res.value;
+                if (v && v.byteLength) {
+                    if (!hadData) {
+                        hadData = true;
+                        // Success: retry is no longer needed, free memory.
+                        canReplay = false;
+                        replay = [];
+                    }
+                    if (closed || webSocket.readyState !== 1) break;
+                    webSocket.send(v);
+                }
+            }
+        } catch (e) {
+            err = e;
+        }
+        try {
+            reader.releaseLock();
+        } catch (e) {}
+        if (closed) return;
+
+        const meta = {
+            kind: destMeta.kind,
+            port: destMeta.port,
+            host: destMeta.host,
+            via: att.label,
+        };
+        if (hadData) {
+            if (att.label === "direct") relayStats.directOk++;
+            else relayStats.fallbackOk++;
+            relayStats.completed++;
+            closeAll();
+            return;
+        }
+        // No bytes ever came back from this attempt.
+        if (att.label === "direct") relayStats.directNoData++;
+        relayLog(env, "no_data", { ...meta, error: err ? relayErr(err) : "closed_without_data" });
+        if (hasMore && canReplay) {
+            safeCloseSocket(sock);
+            await switchFrom(idx + 1);
+        } else {
+            closeAll(1011, "no data from remote");
+        }
+    }
+
+    async function switchFrom(startIdx) {
+        switching = true;
+        for (let i = startIdx; i < attempts.length; i++) {
+            if (closed) return;
+            try {
+                const sock = await openAttempt(attempts[i]);
+                switching = false;
+                relayLog(env, "fallback_open", {
+                    kind: destMeta.kind,
+                    port: destMeta.port,
+                    host: destMeta.host,
+                    via: attempts[i].label,
+                });
+                pump(sock, i).catch(() => closeAll());
+                return;
+            } catch (e) {
+                relayStats.fallbackFail++;
+                relayLog(env, "fallback_fail", {
+                    via: attempts[i].label,
+                    error: relayErr(e),
+                    kind: destMeta.kind,
+                    port: destMeta.port,
+                    host: destMeta.host,
+                });
+            }
+        }
+        switching = false;
+        closeAll(1011, "all attempts failed");
+    }
+
     async function parseSensorData(bufferData, wsRelayIdx) {
+        if (!(bufferData instanceof ArrayBuffer) || bufferData.byteLength < 8) {
+            relayStats.parseFail++;
+            throw new Error("bad_first_frame");
+        }
         const view = new Uint8Array(bufferData);
         let targetAddr = "",
             targetPort = 0,
             offset = 0,
-            isModeAlpha = false,
             activeProfile = null;
+        const profiles = getRelayProfiles(env);
+        const idOf = (p) => p.id.replace(/-/g, "").toLowerCase();
 
         if (view[0] === 0x00) {
             isModeAlpha = true;
-
+            if (bufferData.byteLength < 24) {
+                relayStats.parseFail++;
+                throw new Error("short_header");
+            }
             let clientHash = Array.from(view.slice(1, 17))
                 .map((b) => b.toString(16).padStart(2, "0"))
                 .join("");
             let configEntry = lookupConfigEntry(clientHash);
 
             if (configEntry) {
-                activeClientHash = configEntry.userId
-                    .replace(/-/g, "")
-                    .toLowerCase();
-                activeProfile = getAllProfiles().find(
-                    (p) =>
-                        p.id.replace(/-/g, "").toLowerCase() ===
-                        activeClientHash,
-                );
-                if (!activeProfile) return false;
+                activeClientHash = configEntry.userId.replace(/-/g, "").toLowerCase();
+                activeProfile = profiles.find((p) => idOf(p) === activeClientHash);
+                if (!activeProfile) {
+                    relayStats.authFail++;
+                    throw new Error("unknown_profile");
+                }
                 if (configEntry.relayIp)
-                    activeProfile = {
-                        ...activeProfile,
-                        proxyIp: configEntry.relayIp,
-                    };
+                    activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
             } else {
                 let decoded = decodeConfigUuid(clientHash);
                 if (decoded) {
-                    activeProfile = getAllProfiles().find((p) =>
-                        p.id
-                            .replace(/-/g, "")
-                            .toLowerCase()
-                            .startsWith(decoded.userFingerprint),
+                    activeProfile = profiles.find((p) =>
+                        idOf(p).startsWith(decoded.userFingerprint),
                     );
                     if (activeProfile && decoded.relayIpIndex >= 0) {
                         const effectivePips = getEffectivePips(activeProfile);
                         if (effectivePips.length > 0) {
-                            const idx =
-                                decoded.relayIpIndex % effectivePips.length;
-                            activeProfile = {
-                                ...activeProfile,
-                                proxyIp: effectivePips[idx],
-                            };
+                            const idx = decoded.relayIpIndex % effectivePips.length;
+                            activeProfile = { ...activeProfile, proxyIp: effectivePips[idx] };
                         }
                     }
                 }
+                if (!activeProfile)
+                    activeProfile = profiles.find((p) => idOf(p) === clientHash);
                 if (!activeProfile) {
-                    activeProfile = getAllProfiles().find(
-                        (p) =>
-                            p.id.replace(/-/g, "").toLowerCase() === clientHash,
-                    );
+                    relayStats.authFail++;
+                    throw new Error("unknown_profile");
                 }
-                if (!activeProfile) return false;
-                activeClientHash = activeProfile.id
-                    .replace(/-/g, "")
-                    .toLowerCase();
+                activeClientHash = idOf(activeProfile);
             }
-            trackUsage(activeClientHash, 0, env, ctx);
-
-            let currentConns = activeConns.get(activeClientHash) || 0;
-            if (activeProfile && activeProfile.connLimit) {
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-            }
-            activeConns.set(activeClientHash, currentConns + 1);
-
-            let uTrack = uuidUsage.get(activeClientHash) || {
-                connects: 0,
-                last: 0,
-            };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(activeClientHash, uTrack);
 
             const optLen = view[17];
             const pPos = 18 + optLen + 1;
-            targetPort = new DataView(
-                bufferData.slice(pPos, pPos + 2),
-            ).getUint16(0);
+            if (pPos + 3 > bufferData.byteLength) {
+                relayStats.parseFail++;
+                throw new Error("short_header");
+            }
+            targetPort = new DataView(bufferData, pPos, 2).getUint16(0);
             const aType = view[pPos + 2];
             let vPos = pPos + 3,
                 aLen = 0;
-
             if (aType === 1) {
                 aLen = 4;
                 targetAddr = view.slice(vPos, vPos + aLen).join(".");
             } else if (aType === 2) {
                 aLen = view[vPos];
                 vPos++;
-                targetAddr = new TextDecoder().decode(
-                    view.slice(vPos, vPos + aLen),
-                );
+                targetAddr = new TextDecoder().decode(view.slice(vPos, vPos + aLen));
             } else if (aType === 3) {
                 aLen = 16;
-                const dv = new DataView(bufferData.slice(vPos, vPos + aLen));
+                if (vPos + aLen > bufferData.byteLength) {
+                    relayStats.parseFail++;
+                    throw new Error("short_header");
+                }
+                const dv = new DataView(bufferData, vPos, aLen);
                 targetAddr = Array.from({ length: 8 }, (_, i) =>
                     dv.getUint16(i * 2).toString(16),
                 ).join(":");
@@ -6202,195 +6739,167 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             offset = vPos + aLen;
         } else {
             let ePos = bufferData.byteLength;
-            for (let i = 0; i < bufferData.byteLength; i++) {
+            for (let i = 0; i + 1 < bufferData.byteLength; i++) {
                 if (view[i] === 0x0d && view[i + 1] === 0x0a) {
                     ePos = i;
                     break;
                 }
             }
-
             let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
             let configEntry = lookupConfigEntry(clientHashHex);
 
             if (configEntry) {
-                activeClientHash = configEntry.userId
-                    .replace(/-/g, "")
-                    .toLowerCase();
-                activeProfile = getAllProfiles().find(
-                    (p) =>
-                        p.id.replace(/-/g, "").toLowerCase() ===
-                        activeClientHash,
-                );
-                if (!activeProfile) return false;
+                activeClientHash = configEntry.userId.replace(/-/g, "").toLowerCase();
+                activeProfile = profiles.find((p) => idOf(p) === activeClientHash);
+                if (!activeProfile) {
+                    relayStats.authFail++;
+                    throw new Error("unknown_profile");
+                }
                 if (configEntry.relayIp)
-                    activeProfile = {
-                        ...activeProfile,
-                        proxyIp: configEntry.relayIp,
-                    };
+                    activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
             } else {
-                activeProfile = getAllProfiles().find(
-                    (p) => getTrojanHash(p.id) === clientHashHex,
-                );
-                if (!activeProfile) return false;
-                activeClientHash = activeProfile.id
-                    .replace(/-/g, "")
-                    .toLowerCase();
+                activeProfile = profiles.find((p) => getTrojanHash(p.id) === clientHashHex);
+                if (!activeProfile) {
+                    relayStats.authFail++;
+                    throw new Error("unknown_profile");
+                }
+                activeClientHash = idOf(activeProfile);
                 if (wsRelayIdx >= 0) {
                     const effectivePips = getEffectivePips(activeProfile);
                     if (effectivePips.length > 0) {
                         activeProfile = {
                             ...activeProfile,
-                            proxyIp:
-                                effectivePips[
-                                    wsRelayIdx % effectivePips.length
-                                ],
+                            proxyIp: effectivePips[wsRelayIdx % effectivePips.length],
                         };
                     }
                 }
             }
-            trackUsage(activeClientHash, 0, env, ctx);
-            let currentConns = activeConns.get(activeClientHash) || 0;
-            if (activeProfile && activeProfile.connLimit) {
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-            }
-            activeConns.set(activeClientHash, currentConns + 1);
-            let uTrack = uuidUsage.get(activeClientHash) || {
-                connects: 0,
-                last: 0,
-            };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(activeClientHash, uTrack);
 
             let hPos = ePos + 2;
-            hPos++;
+            hPos++; // command byte
             let aType = view[hPos];
             hPos++;
             let aLen = 0;
-
             if (aType === 1) {
                 aLen = 4;
                 targetAddr = view.slice(hPos, hPos + aLen).join(".");
             } else if (aType === 3) {
                 aLen = view[hPos];
                 hPos++;
-                targetAddr = new TextDecoder().decode(
-                    view.slice(hPos, hPos + aLen),
-                );
+                targetAddr = new TextDecoder().decode(view.slice(hPos, hPos + aLen));
             } else if (aType === 4) {
                 aLen = 16;
-                const dv = new DataView(bufferData.slice(hPos, hPos + aLen));
+                if (hPos + aLen > bufferData.byteLength) {
+                    relayStats.parseFail++;
+                    throw new Error("short_header");
+                }
+                const dv = new DataView(bufferData, hPos, aLen);
                 targetAddr = Array.from({ length: 8 }, (_, i) =>
                     dv.getUint16(i * 2).toString(16),
                 ).join(":");
             }
-
             hPos += aLen;
-            targetPort = new DataView(
-                bufferData.slice(hPos, hPos + 2),
-            ).getUint16(0);
+            if (hPos + 2 > bufferData.byteLength) {
+                relayStats.parseFail++;
+                throw new Error("short_header");
+            }
+            targetPort = new DataView(bufferData, hPos, 2).getUint16(0);
             offset = hPos + 4;
         }
 
-        let isDomain =
+        if (!targetAddr || !(targetPort > 0)) {
+            relayStats.parseFail++;
+            throw new Error("bad_target");
+        }
+
+        // Per-user connection limit (counter is only touched if we counted).
+        trackUsage(activeClientHash, 0, env, ctx);
+        let currentConns = activeConns.get(activeClientHash) || 0;
+        if (activeProfile.connLimit && currentConns >= activeProfile.connLimit) {
+            relayStats.limitReject++;
+            closeAll(1008, "connection limit");
+            return;
+        }
+        activeConns.set(activeClientHash, currentConns + 1);
+        counted = true;
+        let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
+        uTrack.connects++;
+        uTrack.last = Date.now();
+        uuidUsage.set(activeClientHash, uTrack);
+
+        const isIpLiteral =
+            /^\d{1,3}(\.\d{1,3}){3}$/.test(targetAddr) || targetAddr.includes(":");
+        destMeta = {
+            kind: isIpLiteral ? "ip" : "domain",
+            port: targetPort,
+            host: targetAddr,
+        };
+
+        // Direct attempt (optionally via the configured DoH resolver).
+        let connectAddr = targetAddr;
+        let resolvedIp = null;
+        const isDomain =
             /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) ||
             /^[a-zA-Z0-9-]+$/.test(targetAddr);
-        let connectAddr = targetAddr;
         if (isDomain && sysConfig.customDns) {
+            resolvedIp = await resolveTargetIPv4(targetAddr);
+            if (resolvedIp) connectAddr = resolvedIp;
+        }
+        const destIp = resolvedIp || (isIpLiteral ? targetAddr : null);
+        const destIsCf = destIp ? isCloudflareIPv4(destIp) : null;
+        if (destIsCf) relayStats.directToCloudflareIp++;
+
+        attempts = [
+            { label: "direct", host: connectAddr, port: targetPort, v6: false, bracket: false },
+        ];
+        for (const fb of buildRelayFallbacks(activeProfile, targetPort)) {
+            attempts.push({
+                label: "fallback",
+                host: fb.host,
+                port: fb.port,
+                v6: fb.v6,
+                bracket: fb.v6,
+            });
+        }
+
+        if (offset < bufferData.byteLength) recordChunk(bufferData.slice(offset));
+
+        relayLog(env, "connect", {
+            kind: destMeta.kind,
+            port: targetPort,
+            host: targetAddr,
+            dns: isDomain ? (resolvedIp ? "resolved" : "unresolved") : "n/a",
+            destIsCloudflareIp: destIsCf,
+            fallbacks: attempts.length - 1,
+        });
+
+        // Walk through the attempts until one opens.
+        for (let i = 0; i < attempts.length; i++) {
             try {
-                const dohUrl = new URL(sysConfig.customDns);
-                dohUrl.searchParams.set("name", targetAddr);
-                dohUrl.searchParams.set("type", "A");
-                let dnsRes = await fetch(dohUrl.toString(), {
-                    headers: { accept: "application/dns-json" },
-                });
-                let dnsJson = await dnsRes.json();
-                if (dnsJson.Answer && dnsJson.Answer.length > 0) {
-                    connectAddr = dnsJson.Answer[0].data;
-                }
-            } catch (e) {}
-        }
-
-        try {
-            remoteSocket = connect({ hostname: connectAddr, port: targetPort });
-            await remoteSocket.opened;
-        } catch {
-            let pips = [];
-            if (activeProfile && activeProfile.proxyIp) {
-                pips = activeProfile.proxyIp
-                    .split(/[\r\n,;]+/)
-                    .map((s) => s.trim())
-                    .filter(Boolean);
-            }
-            if (pips.length === 0 && sysConfig.backupRelay) {
-                pips = sysConfig.backupRelay
-                    .split(/[\r\n,;]+/)
-                    .map((s) => s.trim())
-                    .filter(Boolean);
-            }
-            if (pips.length === 0 && sysConfig.customRelay) {
-                pips = sysConfig.customRelay
-                    .split(/[\r\n,;]+/)
-                    .map((s) => s.trim())
-                    .filter(Boolean);
-            }
-
-            // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
-            let startIndex = 0;
-            if (pips.length > 1) {
-                let hash = 0;
-                let hashStr = activeProfile ? activeProfile.id : "";
-                for (let i = 0; i < hashStr.length; i++) {
-                    hash = hashStr.charCodeAt(i) + ((hash << 5) - hash);
-                }
-                startIndex = Math.abs(hash) % pips.length;
-            }
-
-            // Attempt to connect with automatic failover to alternative proxy IPs
-            let connected = false;
-            for (
-                let attempt = 0;
-                attempt < Math.min(pips.length, 3);
-                attempt++
-            ) {
-                let currentIndex = (startIndex + attempt) % pips.length;
-                let currentProxy = pips[currentIndex];
-                try {
-                    const [altIP, altPortStr] = currentProxy.split(":");
-                    remoteSocket = connect({
-                        hostname: altIP,
-                        port: altPortStr ? Number(altPortStr) : targetPort,
+                const sock = await openAttempt(attempts[i]);
+                if (i > 0) {
+                    relayLog(env, "fallback_open", {
+                        kind: destMeta.kind,
+                        port: targetPort,
+                        host: targetAddr,
+                        via: "fallback",
                     });
-                    await remoteSocket.opened;
-                    connected = true;
-                    break;
-                } catch (e) {
-                    // Try next fallback proxy IP in list
                 }
-            }
-            if (!connected) {
-                webSocket.close();
-                return isModeAlpha;
+                pump(sock, i).catch(() => closeAll());
+                return;
+            } catch (e) {
+                if (attempts[i].label === "direct") relayStats.directFail++;
+                else relayStats.fallbackFail++;
+                relayLog(env, "open_fail", {
+                    via: attempts[i].label,
+                    error: relayErr(e),
+                    kind: destMeta.kind,
+                    port: targetPort,
+                    host: targetAddr,
+                });
             }
         }
-
-        dataWriter = remoteSocket.writable.getWriter();
-        if (offset < bufferData.byteLength) {
-            let chunk = bufferData.slice(offset);
-            await dataWriter.write(chunk);
-        }
-        remoteSocket.readable.pipeTo(
-            new WritableStream({
-                write(chunk) {
-                    webSocket.send(chunk);
-                },
-            }),
-        );
-
-        return isModeAlpha;
+        closeAll(1011, "all attempts failed");
     }
 }
 
